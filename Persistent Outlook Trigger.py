@@ -1,6 +1,7 @@
 import os
 import base64
 import time
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 import json
@@ -129,7 +130,7 @@ class GraphClient:
         params = {
             "$filter": f"receivedDateTime ge {since_str}",
             "$top":    top,
-            "$select": "id,subject,from,receivedDateTime,bodyPreview,hasAttachments",
+            "$select": "id,subject,from,receivedDateTime,body,hasAttachments,conversationId",
         }
         messages = self._get("/me/mailFolders/inbox/messages", params=params).get("value", [])
         return messages
@@ -140,6 +141,14 @@ class GraphClient:
     def fetch_latest_messages(self, top: int = 5) -> list[dict]:
         params = {"$top": top, "$select": "subject,receivedDateTime,from"}
         return self._get("/me/mailFolders/inbox/messages", params=params).get("value", [])
+
+    def fetch_conversation_thread(self, conversation_id: str) -> list[dict]:
+        params = {
+            "$filter": f"conversationId eq '{conversation_id}'",
+            "$select": "id,subject,from,receivedDateTime,body,hasAttachments",
+        }
+        messages = self._get("/me/mailFolders/inbox/messages", params=params).get("value", [])
+        return sorted(messages, key=lambda m: m["receivedDateTime"])
 
 
 # ── Attachments ───────────────────────────────────────────────────────────────
@@ -186,9 +195,22 @@ class AttachmentManager:
 
 #use this class if you need to print the email in a json body.
 class EmailPrinter:
-    def print_email(self, email: dict, attachments: list[dict], saved_paths: list) -> None:
+    def _strip_html(self, html: str) -> str:
+        return re.sub(r'<[^>]+>', '', html).strip()
+
+    def print_email(self, email: dict, attachments: list[dict], saved_paths: list, thread: list = []) -> None:
+        body = email.get("body", {})
+        if body.get("contentType") == "html":
+            email["body"]["content"] = self._strip_html(body["content"])
+
+        for msg in thread:
+            msg_body = msg.get("body", {})
+            if msg_body.get("contentType") == "html":
+                msg["body"]["content"] = self._strip_html(msg_body["content"])
+
         output = {
             "email": email,
+            "thread": thread,
             "attachments": [
                 {
                     "file_name": att.get("name"),
@@ -225,7 +247,13 @@ class EmailMonitor:
         if email.get("hasAttachments"):
             attachments = self._graph.fetch_attachments(email["id"])
             saved_paths = [self._attachments.save(a) for a in attachments]
-        self._printer.print_email(email, attachments, saved_paths)
+
+        conversation_id = email.get("conversationId")
+        thread = []
+        if conversation_id:
+            thread = self._graph.fetch_conversation_thread(conversation_id)
+
+        self._printer.print_email(email, attachments, saved_paths, thread)
 
     def _poll(self, last_checked: datetime) -> datetime:
         self._refresh_token()
